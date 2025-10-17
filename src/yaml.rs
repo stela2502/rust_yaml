@@ -1,12 +1,9 @@
 use std::collections::HashMap;
 use std::fmt;
-use crate::unity_types::{translate_yaml, TranslationResult};
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::Path;
-
-const UNITY_TYPES_DIR: &str = "/home/med-sal/git_Projects/scenebridge-rs/src/unity_types";
 
 #[derive(Debug, Clone)]
 pub enum Yaml {
@@ -46,164 +43,6 @@ impl Yaml {
         }
     }
 
-    /// Returns `true` if this Yaml node is a hash whose subfields are all
-    /// either primitive values or translatable UnityValue sub-objects.
-    pub fn is_fully_translatable(&self) -> bool {
-        match self {
-            Yaml::Hash(map) => {
-                for (_key, value) in map {
-                    match value {
-                        Yaml::Value(_) => continue,
-                        Yaml::Hash(_) => {
-                            if translate_yaml(value).is_err() {
-                                return false;
-                            }
-                        }
-                        Yaml::Array(_) => return false,
-                    }
-                }
-                true
-            }
-            _ => false,
-        }
-    }
-
-    /// Traverse the YAML hierarchy and try to translate all flat hashes
-    /// under this node (end-level Unity objects).
-    pub fn translate_end_level_unity_objects(&self) -> Result<String, String> {
-        match self {
-            Yaml::Hash(map) => {
-                let mut results = Vec::new();
-
-                for (key, value) in map {
-                    if value.is_fully_translatable() {
-                        match translate_yaml(value) {
-                            Ok(godot_str) => {
-                                // ✅ Success
-                                println!("I could be translated! {godot_str}");
-                                results.push(format!(
-                                    "Translated [{}]:\n{}",
-                                    key,
-                                    godot_str
-                                ));
-                            }
-                            Err(err) => {
-                                // ❌ Failure — show nested YAML formatted
-                                panic!( "failed to translate this yaml:\n{}",value.to_chatty_helper(key));
-                            }
-                        }
-                    } else {
-                        // Not flat → recurse deeper
-                        if let Ok(sub) = value.translate_end_level_unity_objects() {
-                            results.push(format!("Nested [{}]:\n{}", key, sub));
-                        }
-                    }
-                    
-                }
-
-                if results.is_empty() {
-                    Err("No translatable Unity sub-hashes found.".into())
-                } else {
-                    Ok(results.join("\n"))
-                }
-            }
-            _ => Err("Top-level YAML is not a hash.".into()),
-        }
-    }
-
-    /// Generate a UnityValue class from this YAML node and save it directly into unity_types/
-    pub fn generate_unity_class(&self, class_name: &str) -> std::io::Result<()> {
-        let map = match self {
-            Yaml::Hash(map) => map,
-            _ => return Ok(()),
-        };
-
-        let snake_name = Self::to_snake_case(class_name);
-        let struct_name = format!("Unity{}", class_name);
-        let file_name = format!("unity_{}.rs", snake_name);
-        let file_path = Path::new(UNITY_TYPES_DIR).join(&file_name);
-
-        let mut imports = Vec::new();
-        let mut fields = Vec::new();
-
-        for (key, value) in map {
-            // remove m_ prefix if present
-            let key_clean = key.strip_prefix("m_").unwrap_or(key);
-            let field_name = Self::to_snake_case(key_clean);
-            let field_type = Self::guess_field_type(value);
-
-            if field_type.starts_with("Unity") && !imports.contains(&field_type) {
-                imports.push(field_type.clone());
-            }
-            fields.push((field_name, field_type, key.clone()));
-        }
-
-        let mut out = String::new();
-
-        // --- Header ---
-        out.push_str(&format!("// {}\n\n", file_name));
-        out.push_str("use crate::yaml::Yaml;\nuse crate::translator::UnityValue;\n");
-
-        if !imports.is_empty() {
-            out.push_str("use crate::unity_types::{\n");
-            for imp in &imports {
-                out.push_str(&format!("    {},\n", imp));
-            }
-            out.push_str("};\n\n");
-        } else {
-            out.push('\n');
-        }
-
-        // --- Struct ---
-        out.push_str("#[derive(Debug, Clone, PartialEq)]\n");
-        out.push_str(&format!("pub struct {} {{\n", struct_name));
-        for (fname, ftype, _) in &fields {
-            out.push_str(&format!("    pub {}: {},\n", fname, ftype));
-        }
-        out.push_str("}\n\n");
-
-        // --- impl UnityValue ---
-        out.push_str(&format!("impl UnityValue for {} {{\n", struct_name));
-        out.push_str("    fn to_godot(&self) -> String {\n");
-        out.push_str(&format!("        format!(\"[{}]\\\\n...\", \"placeholder\")\n", snake_name));
-        out.push_str("    }\n\n");
-        out.push_str("    fn from_yaml(yaml: &Yaml) -> Option<Self> {\n");
-        out.push_str("        let map = match yaml {\n");
-        out.push_str("            Yaml::Hash(map) => map,\n");
-        out.push_str("            _ => return None,\n");
-        out.push_str("        };\n\n");
-        out.push_str(&format!("        Some({} {{\n", struct_name));
-        for (fname, ftype, key) in &fields {
-            if ftype == "String" {
-                out.push_str(&format!(
-                    "            {}: map.get(\"{}\")?.as_value_string()?,\n",
-                    fname, key
-                ));
-            } else {
-                out.push_str(&format!(
-                    "            {}: {}::from_yaml(map.get(\"{}\")?)?,\n",
-                    fname, ftype, key
-                ));
-            }
-        }
-        out.push_str("        })\n    }\n}\n");
-
-        // --- Write file ---
-        fs::create_dir_all(UNITY_TYPES_DIR)?;
-        fs::write(&file_path, out)?;
-
-        // --- Update mod.rs ---
-        let mod_path = Path::new(UNITY_TYPES_DIR).join("mod.rs");
-        let mut mod_file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(mod_path)?;
-        writeln!(mod_file, "pub use unity_{}::{};", snake_name, struct_name)?;
-
-        println!("✅ Generated and saved {}", file_path.display());
-        Ok(())
-    }
-
     fn to_snake_case(name: &str) -> String {
         let mut result = String::new();
         for (i, ch) in name.chars().enumerate() {
@@ -241,28 +80,6 @@ impl Yaml {
         format!("{}", Yaml::Hash(tmp))
     }
 
-
-    /// Build a Chatty-style summary: shows which sub-hashes translated successfully.
-    /// Each key maps either to the detected class name or to an "untranslated" placeholder.
-    pub fn to_chatty_helper(&self, key: &str) -> String {
-        let mut outer = HashMap::<String, Yaml>::new();
-        let mut inner = HashMap::<String, Yaml>::new();
-
-        if let Yaml::Hash(map) = self {
-            for (sub_key, value) in map {
-                if let Ok(result) = translate_yaml(value) {
-                    // ✅ Translatable → insert the detected type name or result marker
-                    inner.insert(sub_key.to_string(), Yaml::Value(result));
-                } else {
-                    // ❌ Not translatable → recurse or mark as "untranslated"
-                    inner.insert(sub_key.to_string(), value.clone());
-                }
-            }
-        }
-
-        outer.insert(key.to_string(), Yaml::Hash(inner));
-        format!("{}", Yaml::Hash(outer))
-    }
 
     pub fn get_val(&self) -> Option<&str> {
         if let Yaml::Value(s) = self {
